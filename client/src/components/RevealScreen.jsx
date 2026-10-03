@@ -1,4 +1,4 @@
-import { socket } from "../socket.js";
+﻿import { socket } from "../socket.js";
 
 export default function RevealScreen({ scene, teamGuess, aiGuess, scores }) {
   return (
@@ -24,9 +24,9 @@ export default function RevealScreen({ scene, teamGuess, aiGuess, scores }) {
       </div>
 
       <p className="footnote">
-        Scores are placeholder word-overlap (mockSimilarity in mockAI.js) —
-        Phase 5 swaps this for real embedding cosine similarity, and both
-        guesses come from Gemini instead of the mock lists.
+        Scores come from real Gemini embeddings (semanticSimilarity in
+        ai.js), with a word-overlap fallback only if that call fails. Both
+        guesses are genuine Gemini calls, not a mock list.
       </p>
 
       <button

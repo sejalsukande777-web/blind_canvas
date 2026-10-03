@@ -1,8 +1,8 @@
-// index.js — AI AirDraw Arena server
+﻿// index.js - Blind Canvas server
 //
-// PHASE 1 + 2 scope: single shared room, mouse-drawing (gesture comes in
-// Phase 3), full state machine: LOBBY -> DRAWING -> REASSEMBLY -> GUESS -> REVEAL.
-// Mock AI (see mockAI.js) stands in for real Gemini calls until Phase 5.
+// Full state machine: LOBBY -> DRAWING -> REASSEMBLY -> GUESS -> REVEAL.
+// Gesture-drawing (MediaPipe) and real Gemini AI calls (ai.js) are both live.
+// Still pending: real Web Speech API transcription for the banned-word penalty.
 import "dotenv/config";
 import express from "express";
 import { createServer } from "http";
@@ -27,7 +27,7 @@ function freshState() {
   return {
     phase: "LOBBY", // LOBBY | DRAWING | REASSEMBLY | GUESS | REVEAL
     players: [], // { id, name, quadrant }
-    scene: null, // { scene, sharedClue, bannedWords } — server-only until REVEAL
+    scene: null, // { scene, sharedClue, bannedWords } â€” server-only until REVEAL
     difficulty: "easy",
     timeLeft: DRAW_SECONDS,
     timerHandle: null,
@@ -44,7 +44,7 @@ function freshState() {
 
 function publicState() {
   // Never leak state.scene to clients before REVEAL, and never leak
-  // teammates' actual drawing content before REASSEMBLY — only *whether*
+  // teammates' actual drawing content before REASSEMBLY â€” only *whether*
   // each quadrant has submitted, so the UI can show status without
   // revealing the picture early.
   const { scene, timerHandle, submittedCanvases, ...safe } = state;
@@ -105,7 +105,7 @@ io.on("connection", (socket) => {
     for (const p of state.players) {
       let clue;
       if (state.difficulty === "hard") {
-        clue = "(no clue this round — good luck)";
+        clue = "(no clue this round â€” good luck)";
       } else if (state.difficulty === "medium") {
         clue = state.scene.subClues[p.quadrant];
       } else {
@@ -120,7 +120,7 @@ io.on("connection", (socket) => {
 
     // Deliberately NOT starting the timer here. It only starts once every
     // connected player has confirmed their camera (or mouse fallback) is
-    // actually working — see "player_ready" below — so nobody loses real
+    // actually working â€” see "player_ready" below â€” so nobody loses real
     // drawing time to a webcam that's still loading or never came up.
     broadcastState();
   });
@@ -152,7 +152,7 @@ io.on("connection", (socket) => {
     broadcastState();
   });
 
-  // Ghost-hand: broadcast cursor/pointer position only — never canvas content —
+  // Ghost-hand: broadcast cursor/pointer position only â€” never canvas content â€”
   // during the drawing phase, so teammates get a sense of hand movement
   // without seeing what's actually being drawn.
   socket.on("ghost_move", (pos) => {
@@ -191,7 +191,7 @@ io.on("connection", (socket) => {
   });
 
   // Manual override: move on to reassembly even if not everyone has
-  // submitted — e.g. a teammate's camera never worked and they're stuck,
+  // submitted â€” e.g. a teammate's camera never worked and they're stuck,
   // or you're solo-testing with fewer than 4 real players connected.
   // Requires at least one real submission so there's something to reassemble.
   socket.on("force_advance", () => {
@@ -213,7 +213,7 @@ io.on("connection", (socket) => {
     state.teamGuess = teamGuess;
 
     // compositeImage is a single stitched dataURL built client-side from
-    // the team's final arrangement — see ReassemblyBoard.jsx.
+    // the team's final arrangement â€” see ReassemblyBoard.jsx.
     state.aiGuess = await guessFromImage(compositeImage);
     
     state.scores = {
@@ -271,7 +271,7 @@ const AUTO_SUBMIT_GRACE_MS = 1200;
 // someone clicks "Move on without everyone") while players still haven't
 // clicked Submit themselves, we don't just leave their quadrant out of
 // the puzzle. Instead we ask their browser to submit whatever's currently
-// on their canvas — even blank or half-finished — so every quadrant that
+// on their canvas â€” even blank or half-finished â€” so every quadrant that
 // has a real player still shows up in reassembly. A half-drawn piece
 // still tells the team something; a missing piece tells them nothing.
 function maybeAdvanceToReassembly(force = false) {
@@ -297,7 +297,7 @@ function maybeAdvanceToReassembly(force = false) {
 
   // Give them a brief window to respond (submit_canvas is still accepted
   // during this window since phase is still DRAWING), then finalize
-  // regardless — a straggler who's genuinely disconnected or frozen
+  // regardless â€” a straggler who's genuinely disconnected or frozen
   // shouldn't be able to block the round forever.
   setTimeout(() => {
     state.advancing = false;
@@ -309,7 +309,7 @@ function finalizeReassembly() {
   if (state.phase !== "DRAWING") return; // already moved on somehow, don't double-fire
   clearInterval(state.timerHandle);
   state.phase = "REASSEMBLY";
-  // Shuffle quadrant order so pieces come back unlabeled/unordered —
+  // Shuffle quadrant order so pieces come back unlabeled/unordered â€”
   // the team has to figure out correct placement themselves.
   const indices = Object.keys(state.submittedCanvases).map(Number);
   state.shuffledOrder = shuffle(indices);
@@ -330,3 +330,4 @@ app.get("/", (_req, res) => res.send("AI AirDraw Arena server running."));
 httpServer.listen(PORT, () =>
   console.log(`AI AirDraw Arena server listening on :${PORT}`)
 );
+
