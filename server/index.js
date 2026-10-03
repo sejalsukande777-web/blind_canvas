@@ -2,7 +2,7 @@
 //
 // Full state machine: LOBBY -> DRAWING -> REASSEMBLY -> GUESS -> REVEAL.
 // Gesture-drawing (MediaPipe) and real Gemini AI calls (ai.js) are both live.
-// Still pending: real Web Speech API transcription for the banned-word penalty.
+// Speech detection (Web Speech API) for the banned-word penalty is also live.
 import "dotenv/config";
 import express from "express";
 import { createServer } from "http";

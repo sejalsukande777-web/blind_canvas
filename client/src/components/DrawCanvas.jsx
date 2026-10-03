@@ -1,6 +1,7 @@
 ﻿import { useEffect, useRef, useState } from "react";
 import { socket } from "../socket.js";
 import { useHandTracking } from "../hooks/useHandTracking.js";
+import { useSpeechPenalty } from "../hooks/useSpeechPenalty.js";
 
 const SIZE = 420;
 
@@ -20,28 +21,25 @@ export default function DrawCanvas({
   const canvasRef = useRef(null);
   const drawing = useRef(false);
   const lastPoint = useRef(null);
-  const [speechTest, setSpeechTest] = useState("");
   const hasSignaledReady = useRef(false);
 
-  // "gesture" is the real player-facing mode. "mouse" only exists as an
-  // emergency fallback if tracking genuinely isn't working (bad lighting,
-  // no webcam, whatever) — framed as troubleshooting, never offered as a
-  // difficulty choice. See the project spec for why this distinction matters.
   const [inputMode, setInputMode] = useState("gesture");
   const gestureActive = inputMode === "gesture";
   const { videoRef, status, error, indexPos, isPinching, handVisible } =
     useHandTracking(gestureActive);
 
-  // Live mouse position in mouse-fallback mode, so we can render our own
-  // guaranteed-visible cursor overlay instead of relying on the OS's
-  // native cursor (which can render poorly/invisibly in some setups).
+  function handleBannedWordDetected(word) {
+    socket.emit("banned_word_spoken", word);
+  }
+  const {
+    listening: micListening,
+    status: micStatus,
+    error: micError,
+    lastHeard,
+  } = useSpeechPenalty(true, bannedWords, handleBannedWordDetected);
+
   const [mousePos, setMousePos] = useState(null);
 
-  // Signal "ready" to the server once — either the camera/model is
-  // genuinely working, or the player deliberately chose mouse fallback
-  // (which needs no loading time). The countdown timer only starts once
-  // every connected player has signaled this, so nobody loses real
-  // drawing time to someone else's webcam still loading.
   useEffect(() => {
     if (hasSignaledReady.current) return;
     const cameraReady = gestureActive && status === "ready";
@@ -52,16 +50,13 @@ export default function DrawCanvas({
     }
   }, [gestureActive, status]);
 
-  // "draw" or "erase" — pinching in erase mode removes part of the
-  // drawing instead of adding to it, so a mistake doesn't mean wiping the
-  // whole canvas with Clear.
   const [tool, setTool] = useState("draw");
   const toolRef = useRef(tool);
   toolRef.current = tool;
 
   const DRAW_COLOR = "#1a1a2e";
   const DRAW_WIDTH = 4;
-  const ERASE_WIDTH = 26; // wider than the pen, like a real eraser tip
+  const ERASE_WIDTH = 26;
 
   useEffect(() => {
     const ctx = canvasRef.current.getContext("2d");
@@ -81,7 +76,6 @@ export default function DrawCanvas({
     ctx.stroke();
   }
 
-  // --- Mouse fallback handlers (only wired up in "mouse" mode) ----------
   function getMousePos(e) {
     const rect = canvasRef.current.getBoundingClientRect();
     return { x: e.clientX - rect.left, y: e.clientY - rect.top };
@@ -94,7 +88,7 @@ export default function DrawCanvas({
 
   function handlePointerMove(e) {
     const pos = getMousePos(e);
-    setMousePos(pos); // drive our own visible cursor overlay
+    setMousePos(pos);
     socket.emit("ghost_move", { x: pos.x / SIZE, y: pos.y / SIZE });
     if (!drawing.current) return;
     drawSegment(lastPoint.current, pos);
@@ -107,10 +101,9 @@ export default function DrawCanvas({
 
   function handlePointerLeave() {
     drawing.current = false;
-    setMousePos(null); // hide the cursor overlay when the mouse leaves the canvas
+    setMousePos(null);
   }
 
-  // --- Gesture drawing: pinch = pen down, index fingertip = pen position -
   useEffect(() => {
     if (!gestureActive || !indexPos) return;
     const pos = { x: indexPos.x * SIZE, y: indexPos.y * SIZE };
@@ -122,10 +115,6 @@ export default function DrawCanvas({
         const dx = pos.x - lastPoint.current.x;
         const dy = pos.y - lastPoint.current.y;
         const moved = Math.sqrt(dx * dx + dy * dy);
-        // Deadzone: skip drawing (and updating lastPoint) for movements
-        // this tiny — they're almost always residual tracking jitter, not
-        // an intentional hand movement. Real strokes easily clear this in
-        // a frame or two, so it doesn't cost visible responsiveness.
         if (moved < 2) return;
         drawSegment(lastPoint.current, pos);
       }
@@ -149,31 +138,15 @@ export default function DrawCanvas({
     socket.emit("submit_canvas", dataUrl);
   }
 
-  // Server-initiated: fires when the round is ending (timer hit zero, or
-  // "Move on without everyone" was clicked) and this player hasn't
-  // clicked Submit yet. We submit whatever's currently on the canvas —
-  // even blank — so this quadrant still shows up in reassembly instead
-  // of just being missing. A half-finished piece still tells the team
-  // something; a missing one tells them nothing.
   useEffect(() => {
     function handleAutoSubmitRequest() {
-      if (submitted) return; // already submitted manually, nothing to do
+      if (submitted) return;
       submit();
     }
     socket.on("request_auto_submit", handleAutoSubmitRequest);
     return () => socket.off("request_auto_submit", handleAutoSubmitRequest);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [submitted]);
-
-  // TODO(Phase 4): replace this manual tester with real Web Speech API
-  // live transcription, checked continuously against `bannedWords`.
-  function testSpeech(e) {
-    e.preventDefault();
-    const said = speechTest.toLowerCase();
-    const hit = bannedWords.find((w) => said.includes(w.toLowerCase()));
-    if (hit) socket.emit("banned_word_spoken", hit);
-    setSpeechTest("");
-  }
 
   const others = players.filter((p) => p.quadrant !== quadrant);
   const readyCount = (readyPlayerIds || []).length;
@@ -257,6 +230,23 @@ export default function DrawCanvas({
           </button>
         </div>
       )}
+
+      <div className="gesture-status-row">
+        {micStatus === "unsupported" && (
+          <span className="pill pill-error">Speech detection not supported — use Chrome</span>
+        )}
+        {micStatus === "error" && (
+          <span className="pill pill-error">{micError}</span>
+        )}
+        {micStatus === "listening" && (
+          <span className="pill pill-accent">🎤 Listening for banned words</span>
+        )}
+        {lastHeard && (
+          <span className="pill" title="Most recently heard sentence">
+            Heard: "{lastHeard}"
+          </span>
+        )}
+      </div>
 
       <div className="row" style={{ alignItems: "flex-start", gap: 24 }}>
         <div className="canvas-stack">
@@ -375,25 +365,6 @@ export default function DrawCanvas({
         >
           Move on without everyone
         </button>
-      </div>
-
-      <div className="speech-tester">
-        <p className="footnote">
-          Dev stub for Phase 4 (Web Speech API): type what you'd "say" out
-          loud — saying a banned word deducts time.
-        </p>
-        <form onSubmit={testSpeech} className="row">
-          <input
-            className="input"
-            placeholder="simulate speaking..."
-            value={speechTest}
-            onChange={(e) => setSpeechTest(e.target.value)}
-            autoComplete="off"
-          />
-          <button className="btn" type="submit">
-            Say it
-          </button>
-        </form>
       </div>
     </div>
   );
