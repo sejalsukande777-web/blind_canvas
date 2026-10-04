@@ -19,6 +19,22 @@ const DRAW_SECONDS = 90;
 const PENALTY_SECONDS = 15;
 const MAX_PLAYERS = 4;
 
+// Simple per-socket cooldown to stop a single client from spamming
+// AI-calling events (start_game -> generatePrompt, guess_submit ->
+// guessFromImage/semanticSimilarity) and burning through the Gemini
+// quota. Not a full abuse-prevention system, just a basic brake.
+const RATE_LIMIT_MS = 3000;
+const lastActionTime = new Map(); // 'socketId:action' -> timestamp
+
+function isRateLimited(socket, action) {
+  const key = socket.id + ':' + action;
+  const now = Date.now();
+  const last = lastActionTime.get(key) || 0;
+  if (now - last < RATE_LIMIT_MS) return true;
+  lastActionTime.set(key, now);
+  return false;
+}
+
 // --- Single-room game state (MVP: one game at a time) -----------------
 // TODO(later): key this by roomId to support multiple concurrent games.
 let state = freshState();
@@ -87,7 +103,12 @@ io.on("connection", (socket) => {
   });
 
   socket.on("start_game", async (difficulty) => {
+    if (state.phase !== "LOBBY") return; // can't start a round that's already in progress
     if (state.players.length < 1) return; // allow solo testing
+    if (isRateLimited(socket, 'start_game')) {
+      socket.emit('join_error', 'Please wait a moment before starting another round.');
+      return;
+    }
     state.difficulty = difficulty || "easy";
     state.scene = await generatePrompt(state.difficulty);
     state.phase = "DRAWING";
@@ -210,6 +231,7 @@ io.on("connection", (socket) => {
 
   socket.on("guess_submit", async ({ teamGuess, compositeImage }) => {
     if (state.phase !== "GUESS") return;
+    if (isRateLimited(socket, 'guess_submit')) return;
     state.teamGuess = teamGuess;
 
     // compositeImage is a single stitched dataURL built client-side from
@@ -233,6 +255,8 @@ io.on("connection", (socket) => {
 
   socket.on("disconnect", () => {
     state.players = state.players.filter((p) => p.id !== socket.id);
+    lastActionTime.delete(socket.id + ':start_game');
+    lastActionTime.delete(socket.id + ':guess_submit');
     state.readyPlayerIds = state.readyPlayerIds.filter((id) => id !== socket.id);
     // If everyone remaining happens to already be ready, this disconnect
     // might be exactly what was blocking the countdown from starting.
@@ -330,4 +354,8 @@ app.get("/", (_req, res) => res.send("AI AirDraw Arena server running."));
 httpServer.listen(PORT, () =>
   console.log(`AI AirDraw Arena server listening on :${PORT}`)
 );
+
+
+
+
 
