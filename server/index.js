@@ -51,6 +51,7 @@ function freshState() {
     readyPlayerIds: [], // socket ids who confirmed camera-ready (or chose mouse fallback)
     advancing: false, // true during the brief auto-submit grace window at round end
     submittedCanvases: {}, // quadrant(0-3) -> dataURL, only revealed to clients at REASSEMBLY+
+    roundQuadrants: [], // quadrants assigned when the round started -- the puzzle always shows this many pieces, even if someone disconnects or never draws, instead of silently shrinking
     shuffledOrder: null, // array of quadrant indices in shuffled display order
     teamGuess: null,
     aiGuess: null,
@@ -117,6 +118,7 @@ io.on("connection", (socket) => {
     state.readyPlayerIds = [];
     state.advancing = false;
     state.submittedCanvases = {};
+    state.roundQuadrants = state.players.map((p) => p.quadrant);
 
     // Clue specificity is the difficulty knob that fixes the "everyone
     // draws the same generic thing" problem: shared clue = easy but
@@ -335,7 +337,7 @@ function finalizeReassembly() {
   state.phase = "REASSEMBLY";
   // Shuffle quadrant order so pieces come back unlabeled/unordered â€”
   // the team has to figure out correct placement themselves.
-  const indices = Object.keys(state.submittedCanvases).map(Number);
+  const indices = state.roundQuadrants; // always all assigned quadrants, not just the ones that got submitted
   state.shuffledOrder = shuffle(indices);
   broadcastState();
 }
@@ -354,6 +356,9 @@ app.get("/", (_req, res) => res.send("AI AirDraw Arena server running."));
 httpServer.listen(PORT, () =>
   console.log(`AI AirDraw Arena server listening on :${PORT}`)
 );
+
+
+
 
 
 

@@ -3,13 +3,7 @@ import { socket } from "../socket.js";
 
 const TILE = 220;
 
-// NOTE: plain HTML5 drag-and-drop, deliberately NOT auto-snapping —
-// a piece only lands in a cell when the team explicitly drops it there.
-// No magnetic/proximity assist. If touch/mobile support becomes a
-// priority later, swap this for dnd-kit (already in the spec as the
-// intended upgrade path) without changing the surrounding game logic.
 export default function ReassemblyBoard({ shuffledImages, locked, onLockArrangement }) {
-  // cells[i] = index into shuffledImages currently placed in grid cell i, or null
   const [cells, setCells] = useState([null, null, null, null]);
   const [guess, setGuess] = useState("");
   const canvasRef = useRef(null);
@@ -25,7 +19,6 @@ export default function ReassemblyBoard({ shuffledImages, locked, onLockArrangem
     const sourceIndex = Number(e.dataTransfer.getData("text/plain"));
     setCells((prev) => {
       const next = [...prev];
-      // if this image was already placed elsewhere, clear that cell first
       const existingCell = next.indexOf(sourceIndex);
       if (existingCell !== -1) next[existingCell] = null;
       next[cellIndex] = sourceIndex;
@@ -38,6 +31,9 @@ export default function ReassemblyBoard({ shuffledImages, locked, onLockArrangem
     canvas.width = TILE * 2;
     canvas.height = TILE * 2;
     const ctx = canvas.getContext("2d");
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
     const positions = [
       [0, 0],
       [TILE, 0],
@@ -47,6 +43,8 @@ export default function ReassemblyBoard({ shuffledImages, locked, onLockArrangem
     return Promise.all(
       cells.map((imgIndex, cellIndex) => {
         if (imgIndex === null) return Promise.resolve();
+        const src = shuffledImages[imgIndex];
+        if (!src) return Promise.resolve();
         return new Promise((resolve) => {
           const image = new Image();
           image.onload = () => {
@@ -54,14 +52,14 @@ export default function ReassemblyBoard({ shuffledImages, locked, onLockArrangem
             ctx.drawImage(image, x, y, TILE, TILE);
             resolve();
           };
-          image.src = shuffledImages[imgIndex];
+          image.src = src;
         });
       })
     ).then(() => canvas.toDataURL("image/png"));
   }
 
   function lockArrangement() {
-    if (trayImages.length > 0) return; // every available piece must be placed, but the grid can stay partially empty if fewer than 4 pieces exist
+    if (trayImages.length > 0) return;
     socket.emit("reassembly_submit");
     onLockArrangement?.();
   }
@@ -73,6 +71,25 @@ export default function ReassemblyBoard({ shuffledImages, locked, onLockArrangem
     socket.emit("guess_submit", { teamGuess: guess.trim(), compositeImage });
   }
 
+  function PieceTile({ src, draggable, onDragStart, className }) {
+    if (!src) {
+      return (
+        <div className={`tile-img tile-blank ${className || ""}`} draggable={draggable} onDragStart={onDragStart}>
+          <span className="tile-blank-label">blank</span>
+        </div>
+      );
+    }
+    return (
+      <img
+        src={src}
+        alt=""
+        draggable={draggable}
+        onDragStart={onDragStart}
+        className={`tile-img ${className || ""}`}
+      />
+    );
+  }
+
   return (
     <div className="panel">
       <h2 className="section-title">Reassemble the scene</h2>
@@ -82,10 +99,7 @@ export default function ReassemblyBoard({ shuffledImages, locked, onLockArrangem
       </p>
 
       <div className="row" style={{ alignItems: "flex-start", gap: 32 }}>
-        <div
-          className="grid-2x2"
-          style={{ width: TILE * 2, height: TILE * 2 }}
-        >
+        <div className="grid-2x2" style={{ width: TILE * 2, height: TILE * 2 }}>
           {[0, 1, 2, 3].map((cellIndex) => (
             <div
               key={cellIndex}
@@ -95,14 +109,12 @@ export default function ReassemblyBoard({ shuffledImages, locked, onLockArrangem
               onDrop={(e) => handleDrop(cellIndex, e)}
             >
               {cells[cellIndex] !== null ? (
-                <img
+                <PieceTile
                   src={shuffledImages[cells[cellIndex]]}
-                  alt=""
                   draggable={!locked}
                   onDragStart={(e) =>
                     e.dataTransfer.setData("text/plain", String(cells[cellIndex]))
                   }
-                  className="tile-img"
                 />
               ) : (
                 <span className="cell-placeholder">drop here</span>
@@ -115,13 +127,12 @@ export default function ReassemblyBoard({ shuffledImages, locked, onLockArrangem
           <p className="hint">Unplaced pieces</p>
           <div className="tray-items">
             {trayImages.map(({ img, i }) => (
-              <img
+              <PieceTile
                 key={i}
                 src={img}
-                alt=""
                 draggable={!locked}
                 onDragStart={(e) => e.dataTransfer.setData("text/plain", String(i))}
-                className="tile-img tray-img"
+                className="tray-img"
               />
             ))}
           </div>
@@ -149,22 +160,21 @@ export default function ReassemblyBoard({ shuffledImages, locked, onLockArrangem
             answer on the reveal screen.
           </p>
           <form onSubmit={submitGuess} className="row">
-          <input
-            className="input"
-            placeholder="What's the scene? (team's guess)"
-            value={guess}
-            onChange={(e) => setGuess(e.target.value)}
-            autoFocus
-            autoComplete="off"
-          />
-          <button className="btn btn-primary" type="submit">
-            Submit Guess
-          </button>
+            <input
+              className="input"
+              placeholder="What's the scene? (team's guess)"
+              value={guess}
+              onChange={(e) => setGuess(e.target.value)}
+              autoFocus
+              autoComplete="off"
+            />
+            <button className="btn btn-primary" type="submit">
+              Submit Guess
+            </button>
           </form>
         </div>
       )}
 
-      {/* offscreen canvas used only to build the composite image on submit */}
       <canvas ref={canvasRef} style={{ display: "none" }} />
     </div>
   );

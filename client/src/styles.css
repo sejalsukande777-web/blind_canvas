@@ -1,4 +1,4 @@
-:root {
+﻿:root {
   --bg: #14121a;
   --panel: #1e1b28;
   --ink: #f2eefb;
@@ -264,6 +264,21 @@ body {
   border: 1px solid var(--border);
 }
 
+.tile-blank {
+  background: repeating-linear-gradient(45deg, #f5f5f5, #f5f5f5 8px, #ffffff 8px, #ffffff 16px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: grab;
+}
+
+.tile-blank-label {
+  color: #999;
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
 .reveal-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -440,3 +455,4 @@ body {
 .status-pending {
   color: var(--muted);
 }
+
