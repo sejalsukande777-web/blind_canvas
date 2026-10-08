@@ -242,7 +242,7 @@ io.on("connection", (socket) => {
     
     state.scores = {
       teamScore: await semanticSimilarity(teamGuess, state.scene.scene),
-      aiScore: await semanticSimilarity(state.aiGuess, state.scene.scene),
+      aiScore: state.aiGuess ? await semanticSimilarity(state.aiGuess, state.scene.scene) : null,
     };
     state.phase = "REVEAL";
     broadcastState();
@@ -356,6 +356,7 @@ app.get("/", (_req, res) => res.send("AI AirDraw Arena server running."));
 httpServer.listen(PORT, () =>
   console.log(`AI AirDraw Arena server listening on :${PORT}`)
 );
+
 
 
 

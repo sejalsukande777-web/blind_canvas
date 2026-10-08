@@ -1,6 +1,10 @@
 ﻿import { socket } from "../socket.js";
 
 export default function RevealScreen({ scene, teamGuess, aiGuess, scores }) {
+  // null means the AI call failed (e.g. Google's servers were overloaded).
+  // In that case there is no guess to show and nothing to score.
+  const aiFailed = aiGuess === null || aiGuess === undefined;
+
   return (
     <div className="panel">
       <h2 className="section-title">Reveal</h2>
@@ -13,8 +17,17 @@ export default function RevealScreen({ scene, teamGuess, aiGuess, scores }) {
         </div>
         <div className="reveal-card">
           <p className="hint">The AI guessed</p>
-          <p className="reveal-text">{aiGuess}</p>
-          <p className="score">{scores.aiScore}% match</p>
+          {aiFailed ? (
+            <>
+              <p className="reveal-text">The AI couldn't make a guess this round</p>
+              <p className="hint">The AI call failed, so there is no AI score this time.</p>
+            </>
+          ) : (
+            <>
+              <p className="reveal-text">{aiGuess}</p>
+              <p className="score">{scores.aiScore}% match</p>
+            </>
+          )}
         </div>
       </div>
 

@@ -175,7 +175,7 @@ export async function guessFromImage(compositeImageDataUrl) {
     return response.text.trim();
   } catch (err) {
     console.error("[ai.js] guessFromImage failed after retry:", err.message);
-    return "(the AI couldn't make a guess this round)";
+    return null; // null = the call failed, so nobody should score it as a real guess
   }
 }
 
@@ -209,3 +209,4 @@ function wordOverlapSimilarity(a, b) {
   const union = new Set([...wordsA, ...wordsB]).size || 1;
   return Math.round((overlap / union) * 100);
 }
+
