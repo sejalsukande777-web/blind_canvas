@@ -1,4 +1,4 @@
-import { useState } from "react";
+﻿import { useState } from "react";
 import { socket } from "../socket.js";
 
 export default function Lobby({ players, joined }) {
@@ -21,7 +21,7 @@ export default function Lobby({ players, joined }) {
 
   return (
     <div className="panel">
-      <h1 className="title">AI AirDraw Arena</h1>
+      <h1 className="title">Blind Canvas</h1>
       <p className="subtitle">
         Four players. One hidden scene. Nobody sees the whole picture alone.
       </p>
@@ -88,3 +88,4 @@ export default function Lobby({ players, joined }) {
     </div>
   );
 }
+

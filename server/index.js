@@ -351,11 +351,12 @@ function shuffle(arr) {
   return a;
 }
 
-app.get("/", (_req, res) => res.send("AI AirDraw Arena server running."));
+app.get("/", (_req, res) => res.send("Blind Canvas server running."));
 
 httpServer.listen(PORT, () =>
-  console.log(`AI AirDraw Arena server listening on :${PORT}`)
+  console.log(`Blind Canvas server listening on :${PORT}`)
 );
+
 
 
 
