@@ -260,6 +260,12 @@ io.on("connection", (socket) => {
     lastActionTime.delete(socket.id + ':start_game');
     lastActionTime.delete(socket.id + ':guess_submit');
     state.readyPlayerIds = state.readyPlayerIds.filter((id) => id !== socket.id);
+    // Nobody left: reset so the next visitor gets a fresh lobby instead of a
+    // room stuck mid-round with no players in it.
+    if (state.players.length === 0) {
+      clearInterval(state.timerHandle);
+      state = freshState();
+    }
     // If everyone remaining happens to already be ready, this disconnect
     // might be exactly what was blocking the countdown from starting.
     if (
@@ -356,6 +362,7 @@ app.get("/", (_req, res) => res.send("Blind Canvas server running."));
 httpServer.listen(PORT, () =>
   console.log(`Blind Canvas server listening on :${PORT}`)
 );
+
 
 
 
