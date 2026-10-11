@@ -1,14 +1,19 @@
 ﻿// index.js - Blind Canvas server
 //
-// Full state machine: LOBBY -> DRAWING -> REASSEMBLY -> GUESS -> REVEAL.
-// Gesture-drawing (MediaPipe) and real Gemini AI calls (ai.js) are both live.
-// Speech detection (Web Speech API) for the banned-word penalty is also live.
+// Every group plays in its own room, identified by a 4-letter code. Each
+// room runs its own state machine:
+//   LOBBY -> DRAWING -> REASSEMBLY -> GUESS -> REVEAL
+// Hand tracking and speech detection run in the browser, and the Gemini
+// calls live in ai.js. Rooms are kept in memory only, so a room disappears
+// when its last player leaves or the server restarts.
+
 import "dotenv/config";
 import express from "express";
 import { createServer } from "http";
 import { Server } from "socket.io";
 import cors from "cors";
 import { generatePrompt, guessFromImage, semanticSimilarity } from "./ai.js";
+
 const app = express();
 app.use(cors());
 const httpServer = createServer(app);
@@ -18,334 +23,165 @@ const PORT = process.env.PORT || 3001;
 const DRAW_SECONDS = 90;
 const PENALTY_SECONDS = 15;
 const MAX_PLAYERS = 4;
+const MAX_ROOMS = 100;
+const AUTO_SUBMIT_GRACE_MS = 1200;
+const COOLDOWN_MS = 3000;
+const MAX_IMAGE_CHARS = 1500000;
+const RATE_LIMITED_ACTIONS = [
+  "create_room",
+  "join_room",
+  "start_game",
+  "guess_submit",
+  "banned_word_spoken",
+];
 
-// Simple per-socket cooldown to stop a single client from spamming
-// AI-calling events (start_game -> generatePrompt, guess_submit ->
-// guessFromImage/semanticSimilarity) and burning through the Gemini
-// quota. Not a full abuse-prevention system, just a basic brake.
-const RATE_LIMIT_MS = 3000;
-const lastActionTime = new Map(); // 'socketId:action' -> timestamp
+// No I or O, so codes are easy to read out loud.
+const CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ";
 
-function isRateLimited(socket, action) {
-  const key = socket.id + ':' + action;
+const rooms = new Map(); // room code -> room state
+const lastActionTime = new Map(); // "socketId:action" -> timestamp
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+// Simple per-connection cooldown so one client cannot spam actions that
+// cost money (Gemini calls) or hurt other players (penalties).
+function isRateLimited(socket, action, cooldownMs = COOLDOWN_MS) {
+  const key = socket.id + ":" + action;
   const now = Date.now();
   const last = lastActionTime.get(key) || 0;
-  if (now - last < RATE_LIMIT_MS) return true;
+  if (now - last < cooldownMs) return true;
   lastActionTime.set(key, now);
   return false;
 }
 
-// --- Single-room game state (MVP: one game at a time) -----------------
-// TODO(later): key this by roomId to support multiple concurrent games.
-let state = freshState();
+function tooFast(socket) {
+  socket.emit("join_error", "Please wait a moment and try again.");
+}
 
-function freshState() {
+function generateCode() {
+  for (let attempt = 0; attempt < 50; attempt++) {
+    let code = "";
+    for (let i = 0; i < 4; i++) {
+      code += CODE_ALPHABET[Math.floor(Math.random() * CODE_ALPHABET.length)];
+    }
+    if (!rooms.has(code)) return code;
+  }
+  return null;
+}
+
+function freshRoom(code) {
   return {
+    code,
     phase: "LOBBY", // LOBBY | DRAWING | REASSEMBLY | GUESS | REVEAL
     players: [], // { id, name, quadrant }
-    scene: null, // { scene, sharedClue, bannedWords } â€” server-only until REVEAL
+    scene: null, // { scene, sharedClue, subClues, bannedWords } - never sent before REVEAL
     difficulty: "easy",
+    starting: false, // true while the scene is being generated
+    scoring: false, // true while the guesses are being scored
     timeLeft: DRAW_SECONDS,
     timerHandle: null,
-    timerStarted: false, // countdown doesn't run until everyone's confirmed ready
-    readyPlayerIds: [], // socket ids who confirmed camera-ready (or chose mouse fallback)
-    advancing: false, // true during the brief auto-submit grace window at round end
-    submittedCanvases: {}, // quadrant(0-3) -> dataURL, only revealed to clients at REASSEMBLY+
-    roundQuadrants: [], // quadrants assigned when the round started -- the puzzle always shows this many pieces, even if someone disconnects or never draws, instead of silently shrinking
-    shuffledOrder: null, // array of quadrant indices in shuffled display order
+    timerStarted: false, // the countdown waits until everyone's camera is ready
+    readyPlayerIds: [],
+    advancing: false, // true during the short auto-submit window at round end
+    submittedCanvases: {}, // quadrant -> dataURL, only sent to clients from REASSEMBLY on
+    roundQuadrants: [], // quadrants assigned when the round started
+    shuffledOrder: null,
     teamGuess: null,
     aiGuess: null,
     scores: null,
   };
 }
 
-function publicState() {
-  // Never leak state.scene to clients before REVEAL, and never leak
-  // teammates' actual drawing content before REASSEMBLY â€” only *whether*
-  // each quadrant has submitted, so the UI can show status without
-  // revealing the picture early.
-  const { scene, timerHandle, submittedCanvases, ...safe } = state;
+function publicState(room) {
+  // The scene stays hidden until REVEAL, and other players' drawings stay
+  // hidden until REASSEMBLY. Before that clients only learn WHICH quadrants
+  // have submitted, so the status list works without leaking the pictures.
+  const { scene, timerHandle, submittedCanvases, ...safe } = room;
   const submittedQuadrants = Object.keys(submittedCanvases).map(Number);
-  const revealImages = ["REASSEMBLY", "GUESS", "REVEAL"].includes(state.phase);
+  const revealImages = ["REASSEMBLY", "GUESS", "REVEAL"].includes(room.phase);
   return {
     ...safe,
-    scene: state.phase === "REVEAL" ? state.scene.scene : null,
+    scene: room.phase === "REVEAL" && scene ? scene.scene : null,
     submittedQuadrants,
     submittedCanvases: revealImages ? submittedCanvases : {},
   };
 }
 
-function broadcastState() {
-  io.emit("state", publicState());
+function broadcastState(room) {
+  io.to(room.code).emit("state", publicState(room));
 }
 
-io.on("connection", (socket) => {
-  socket.on("join", (name) => {
-    // Idempotent: if this socket already joined, just re-confirm instead
-    // of bouncing them with "Room full" on a second click.
-    const existing = state.players.find((p) => p.id === socket.id);
-    if (existing) {
-      socket.emit("joined");
-      return;
-    }
-    if (state.players.length >= MAX_PLAYERS) {
-      socket.emit("join_error", "Room full (max 4 players).");
-      return;
-    }
-    if (state.phase !== "LOBBY") {
-      socket.emit("join_error", "Game already in progress.");
-      return;
-    }
-    const quadrant = state.players.length; // 0..3, assigned in join order
-    state.players.push({ id: socket.id, name, quadrant });
-    socket.data.quadrant = quadrant;
-    socket.emit("joined");
-    broadcastState();
-  });
-
-  socket.on("start_game", async (difficulty) => {
-    if (state.phase !== "LOBBY") return; // can't start a round that's already in progress
-    if (state.players.length < 1) return; // allow solo testing
-    if (isRateLimited(socket, 'start_game')) {
-      socket.emit('join_error', 'Please wait a moment before starting another round.');
-      return;
-    }
-    state.difficulty = difficulty || "easy";
-    state.scene = await generatePrompt(state.difficulty);
-    state.phase = "DRAWING";
-    state.timeLeft = DRAW_SECONDS;
-    state.timerStarted = false;
-    state.readyPlayerIds = [];
-    state.advancing = false;
-    state.submittedCanvases = {};
-    state.roundQuadrants = state.players.map((p) => p.quadrant);
-
-    // Clue specificity is the difficulty knob that fixes the "everyone
-    // draws the same generic thing" problem: shared clue = easy but
-    // disorienting on reassembly (nothing anchors a piece to its
-    // position), per-quadrant sub-clue = medium and gives reassembly a
-    // real logical anchor, no clue = hard.
-    for (const p of state.players) {
-      let clue;
-      if (state.difficulty === "hard") {
-        clue = "(no clue this round â€” good luck)";
-      } else if (state.difficulty === "medium") {
-        clue = state.scene.subClues[p.quadrant];
-      } else {
-        clue = state.scene.sharedClue;
-      }
-      io.to(p.id).emit("your_assignment", {
-        quadrant: p.quadrant,
-        clue,
-        bannedWords: state.scene.bannedWords,
-      });
-    }
-
-    // Deliberately NOT starting the timer here. It only starts once every
-    // connected player has confirmed their camera (or mouse fallback) is
-    // actually working â€” see "player_ready" below â€” so nobody loses real
-    // drawing time to a webcam that's still loading or never came up.
-    broadcastState();
-  });
-
-  // A client sends this once its camera+hand-tracking is confirmed ready,
-  // OR once it deliberately switched to the mouse fallback (which needs
-  // no loading time, so it's "ready" immediately). Once every currently
-  // connected player has signaled ready, the countdown actually starts.
-  socket.on("player_ready", () => {
-    if (state.phase !== "DRAWING" || state.timerStarted) return;
-    if (!state.readyPlayerIds.includes(socket.id)) {
-      state.readyPlayerIds.push(socket.id);
-    }
-    if (state.readyPlayerIds.length >= state.players.length) {
-      state.timerStarted = true;
-      startTimer();
-    }
-    broadcastState();
-  });
-
-  // Manual escape hatch: if someone's camera is stuck (permission dialog
-  // never resolved, hardware issue, whatever) and they're not responding,
-  // any player can force the countdown to start anyway rather than the
-  // whole team being stuck waiting forever.
-  socket.on("force_start_timer", () => {
-    if (state.phase !== "DRAWING" || state.timerStarted) return;
-    state.timerStarted = true;
-    startTimer();
-    broadcastState();
-  });
-
-  // Ghost-hand: broadcast cursor/pointer position only â€” never canvas content â€”
-  // during the drawing phase, so teammates get a sense of hand movement
-  // without seeing what's actually being drawn.
-  socket.on("ghost_move", (pos) => {
-    socket.broadcast.emit("ghost_move", { playerId: socket.id, ...pos });
-  });
-
-  socket.on("banned_word_spoken", (word) => {
-    if (state.phase !== "DRAWING") return;
-    state.timeLeft = Math.max(0, state.timeLeft - PENALTY_SECONDS);
-    io.emit("penalty", { word, secondsLost: PENALTY_SECONDS });
-    broadcastState();
-  });
-
-  socket.on("submit_canvas", (dataUrl) => {
-    if (state.phase !== "DRAWING") return; // don't accept stray late submits after the round moved on
-    const quadrant = socket.data.quadrant;
-    if (quadrant === undefined) return;
-    state.submittedCanvases[quadrant] = dataUrl;
-    broadcastState(); // so everyone's submission-status list updates immediately
-
-    if (state.advancing) {
-      // A straggler just responded to the auto-submit request during the
-      // grace window. If that was the last one we were waiting on, no
-      // need to sit out the rest of the grace period.
-      const allIn = state.players.every((p) =>
-        Object.prototype.hasOwnProperty.call(state.submittedCanvases, p.quadrant)
-      );
-      if (allIn) {
-        state.advancing = false;
-        finalizeReassembly();
-      }
-      return;
-    }
-
-    maybeAdvanceToReassembly();
-  });
-
-  // Manual override: move on to reassembly even if not everyone has
-  // submitted â€” e.g. a teammate's camera never worked and they're stuck,
-  // or you're solo-testing with fewer than 4 real players connected.
-  // Requires at least one real submission so there's something to reassemble.
-  socket.on("force_advance", () => {
-    if (state.phase !== "DRAWING") return;
-    if (Object.keys(state.submittedCanvases).length === 0) return;
-    maybeAdvanceToReassembly(true);
-  });
-
-  socket.on("reassembly_submit", () => {
-    // First submission locks the team's arrangement for MVP simplicity.
-    // TODO(later): require all players to agree, or a host-confirms flow.
-    if (state.phase !== "REASSEMBLY") return;
-    state.phase = "GUESS";
-    broadcastState();
-  });
-
-  socket.on("guess_submit", async ({ teamGuess, compositeImage }) => {
-    if (state.phase !== "GUESS") return;
-    if (isRateLimited(socket, 'guess_submit')) return;
-    state.teamGuess = teamGuess;
-
-    // compositeImage is a single stitched dataURL built client-side from
-    // the team's final arrangement â€” see ReassemblyBoard.jsx.
-    state.aiGuess = await guessFromImage(compositeImage);
-    
-    state.scores = {
-      teamScore: await semanticSimilarity(teamGuess, state.scene.scene),
-      aiScore: state.aiGuess ? await semanticSimilarity(state.aiGuess, state.scene.scene) : null,
-    };
-    state.phase = "REVEAL";
-    broadcastState();
-  });
-
-  socket.on("reset_game", () => {
-    clearInterval(state.timerHandle);
-    state = freshState();
-    io.emit("game_reset"); // tell every client to drop its local joined/assignment state too
-    broadcastState();
-  });
-
-  socket.on("disconnect", () => {
-    state.players = state.players.filter((p) => p.id !== socket.id);
-    lastActionTime.delete(socket.id + ':start_game');
-    lastActionTime.delete(socket.id + ':guess_submit');
-    state.readyPlayerIds = state.readyPlayerIds.filter((id) => id !== socket.id);
-    // Nobody left: reset so the next visitor gets a fresh lobby instead of a
-    // room stuck mid-round with no players in it.
-    if (state.players.length === 0) {
-      clearInterval(state.timerHandle);
-      state = freshState();
-    }
-    // If everyone remaining happens to already be ready, this disconnect
-    // might be exactly what was blocking the countdown from starting.
-    if (
-      state.phase === "DRAWING" &&
-      !state.timerStarted &&
-      state.players.length > 0 &&
-      state.readyPlayerIds.length >= state.players.length
-    ) {
-      state.timerStarted = true;
-      startTimer();
-    }
-    broadcastState();
-  });
-
-  // Send current state immediately on connect.
-  socket.emit("state", publicState());
-});
-
-function startTimer() {
-  clearInterval(state.timerHandle);
-  state.timerHandle = setInterval(() => {
-    state.timeLeft -= 1;
-    if (state.timeLeft <= 0) {
-      clearInterval(state.timerHandle);
-      state.timeLeft = 0;
-      maybeAdvanceToReassembly(true);
-    }
-    broadcastState();
-  }, 1000);
+function roomOf(socket) {
+  return rooms.get(socket.data.roomId);
 }
 
-const AUTO_SUBMIT_GRACE_MS = 1200;
+function cleanPlayerName(name) {
+  if (typeof name !== "string") return "";
+  return name.replace(/\s+/g, " ").trim().slice(0, 20);
+}
 
-// Grace-period auto-submit: when the round ends (timer hits zero, or
-// someone clicks "Move on without everyone") while players still haven't
-// clicked Submit themselves, we don't just leave their quadrant out of
-// the puzzle. Instead we ask their browser to submit whatever's currently
-// on their canvas â€” even blank or half-finished â€” so every quadrant that
-// has a real player still shows up in reassembly. A half-drawn piece
-// still tells the team something; a missing piece tells them nothing.
-function maybeAdvanceToReassembly(force = false) {
-  if (state.phase !== "DRAWING" || state.advancing) return;
+function isValidImage(value) {
+  return (
+    typeof value === "string" &&
+    value.startsWith("data:image/png;base64,") &&
+    value.length <= MAX_IMAGE_CHARS
+  );
+}
 
-  const submittedQuadrants = new Set(Object.keys(state.submittedCanvases).map(Number));
-  const allSubmitted = submittedQuadrants.size >= state.players.length;
-  if (!force && !allSubmitted) return;
+// Lowest free quadrant, so someone leaving the lobby never causes two
+// players to share a quadrant.
+function freeQuadrant(room) {
+  for (let q = 0; q < MAX_PLAYERS; q++) {
+    if (!room.players.some((p) => p.quadrant === q)) return q;
+  }
+  return -1;
+}
 
-  const stragglers = state.players.filter((p) => !submittedQuadrants.has(p.quadrant));
+function addPlayer(socket, room, name) {
+  const quadrant = freeQuadrant(room);
+  room.players.push({ id: socket.id, name, quadrant });
+  socket.join(room.code);
+  socket.data.roomId = room.code;
+  socket.data.quadrant = quadrant;
+  socket.emit("joined", { code: room.code });
+  broadcastState(room);
+}
 
-  if (stragglers.length === 0) {
-    finalizeReassembly();
+function leaveRoom(socket) {
+  const room = roomOf(socket);
+  socket.data.roomId = undefined;
+  socket.data.quadrant = undefined;
+  if (!room) return;
+
+  socket.leave(room.code);
+  room.players = room.players.filter((p) => p.id !== socket.id);
+  room.readyPlayerIds = room.readyPlayerIds.filter((id) => id !== socket.id);
+
+  if (room.players.length === 0) {
+    clearInterval(room.timerHandle);
+    rooms.delete(room.code);
+    console.log(`[rooms] closed ${room.code} (${rooms.size} active)`);
     return;
   }
 
-  // Ask each straggler's own browser to submit its current canvas right now.
-  state.advancing = true;
-  for (const p of stragglers) {
-    io.to(p.id).emit("request_auto_submit");
+  if (room.phase === "DRAWING") {
+    // This leave may be exactly what was blocking the countdown, or the
+    // last thing the round was waiting for.
+    if (!room.timerStarted && room.readyPlayerIds.length >= room.players.length) {
+      room.timerStarted = true;
+      startTimer(room);
+    }
+    maybeAdvanceToReassembly(room);
   }
-  broadcastState();
-
-  // Give them a brief window to respond (submit_canvas is still accepted
-  // during this window since phase is still DRAWING), then finalize
-  // regardless â€” a straggler who's genuinely disconnected or frozen
-  // shouldn't be able to block the round forever.
-  setTimeout(() => {
-    state.advancing = false;
-    finalizeReassembly();
-  }, AUTO_SUBMIT_GRACE_MS);
+  broadcastState(room);
 }
 
-function finalizeReassembly() {
-  if (state.phase !== "DRAWING") return; // already moved on somehow, don't double-fire
-  clearInterval(state.timerHandle);
-  state.phase = "REASSEMBLY";
-  // Shuffle quadrant order so pieces come back unlabeled/unordered â€”
-  // the team has to figure out correct placement themselves.
-  const indices = state.roundQuadrants; // always all assigned quadrants, not just the ones that got submitted
-  state.shuffledOrder = shuffle(indices);
-  broadcastState();
+// "Play Again" / "Reset Game": back to the lobby, same room, same players.
+function resetRoom(room) {
+  clearInterval(room.timerHandle);
+  Object.assign(room, freshRoom(room.code), { players: room.players });
 }
 
 function shuffle(arr) {
@@ -357,19 +193,336 @@ function shuffle(arr) {
   return a;
 }
 
+function startTimer(room) {
+  clearInterval(room.timerHandle);
+  room.timerHandle = setInterval(() => {
+    room.timeLeft -= 1;
+    if (room.timeLeft <= 0) {
+      clearInterval(room.timerHandle);
+      room.timeLeft = 0;
+      maybeAdvanceToReassembly(room, true);
+    }
+    broadcastState(room);
+  }, 1000);
+}
+
+// When the round ends (everyone submitted, the timer hit zero, or someone
+// clicked "Move on without everyone") any player who has not submitted is
+// asked to submit whatever is on their canvas, even if it is blank or half
+// done. They get a short window to answer, then the round moves on anyway.
+function maybeAdvanceToReassembly(room, force = false) {
+  if (room.phase !== "DRAWING" || room.advancing) return;
+
+  const submitted = new Set(Object.keys(room.submittedCanvases).map(Number));
+  const stragglers = room.players.filter((p) => !submitted.has(p.quadrant));
+  if (!force && stragglers.length > 0) return;
+
+  if (stragglers.length === 0) {
+    finalizeReassembly(room);
+    return;
+  }
+
+  room.advancing = true;
+  for (const p of stragglers) {
+    io.to(p.id).emit("request_auto_submit");
+  }
+  broadcastState(room);
+
+  setTimeout(() => {
+    room.advancing = false;
+    finalizeReassembly(room);
+  }, AUTO_SUBMIT_GRACE_MS);
+}
+
+function finalizeReassembly(room) {
+  if (rooms.get(room.code) !== room || room.phase !== "DRAWING") return;
+  clearInterval(room.timerHandle);
+  room.phase = "REASSEMBLY";
+  // Every quadrant assigned at the start gets a piece, even if that player
+  // left or never drew. Pieces with no drawing show up as blank tiles.
+  room.shuffledOrder = shuffle(room.roundQuadrants);
+  broadcastState(room);
+}
+
+// ---------------------------------------------------------------------------
+// Socket events
+// ---------------------------------------------------------------------------
+
+io.on("connection", (socket) => {
+  socket.on("create_room", (name) => {
+    if (isRateLimited(socket, "create_room")) {
+      tooFast(socket);
+      return;
+    }
+    const cleanName = cleanPlayerName(name);
+    if (!cleanName) {
+      socket.emit("join_error", "Please enter a name first.");
+      return;
+    }
+    if (rooms.size >= MAX_ROOMS) {
+      socket.emit("join_error", "The server is full right now. Try again in a few minutes.");
+      return;
+    }
+    const code = generateCode();
+    if (!code) {
+      socket.emit("join_error", "Could not create a room. Please try again.");
+      return;
+    }
+
+    leaveRoom(socket); // in case this connection was already in a room
+    const room = freshRoom(code);
+    rooms.set(code, room);
+    console.log(`[rooms] created ${code} (${rooms.size} active)`);
+    addPlayer(socket, room, cleanName);
+  });
+
+  socket.on("join_room", (payload) => {
+    if (isRateLimited(socket, "join_room", 1000)) {
+      tooFast(socket);
+      return;
+    }
+    const code = typeof payload?.code === "string" ? payload.code.trim().toUpperCase() : "";
+    const cleanName = cleanPlayerName(payload?.name);
+    if (!cleanName) {
+      socket.emit("join_error", "Please enter a name first.");
+      return;
+    }
+    const room = rooms.get(code);
+    if (!room) {
+      socket.emit("join_error", "No room with that code. Check it and try again.");
+      return;
+    }
+    if (socket.data.roomId === room.code) {
+      socket.emit("joined", { code: room.code }); // already in this room
+      return;
+    }
+    if (room.phase !== "LOBBY" || room.starting) {
+      socket.emit("join_error", "That game has already started.");
+      return;
+    }
+    if (room.players.length >= MAX_PLAYERS) {
+      socket.emit("join_error", "That room is full (max 4 players).");
+      return;
+    }
+
+    leaveRoom(socket);
+    addPlayer(socket, room, cleanName);
+  });
+
+  socket.on("start_game", async (difficulty) => {
+    const room = roomOf(socket);
+    if (!room || room.phase !== "LOBBY" || room.starting) return;
+    if (isRateLimited(socket, "start_game")) {
+      tooFast(socket);
+      return;
+    }
+
+    const level = ["easy", "medium", "hard"].includes(difficulty) ? difficulty : "easy";
+    room.starting = true;
+    broadcastState(room);
+
+    let scene = null;
+    try {
+      scene = await generatePrompt(level);
+    } catch (err) {
+      console.error(`[rooms] ${room.code} scene generation threw:`, err);
+    }
+
+    // Everyone left, or the room was reset, while the scene was generating.
+    if (rooms.get(room.code) !== room || !room.starting) return;
+    room.starting = false;
+
+    if (!scene) {
+      broadcastState(room);
+      socket.emit("join_error", "Could not start the round. Please try again.");
+      return;
+    }
+
+    room.difficulty = level;
+    room.scene = scene;
+    room.phase = "DRAWING";
+    room.timeLeft = DRAW_SECONDS;
+    room.timerStarted = false;
+    room.readyPlayerIds = [];
+    room.advancing = false;
+    room.submittedCanvases = {};
+    room.roundQuadrants = room.players.map((p) => p.quadrant);
+
+    // Clue specificity is the difficulty knob: easy = one shared clue,
+    // medium = a clue per quadrant, hard = no clue.
+    for (const p of room.players) {
+      let clue;
+      if (level === "hard") {
+        clue = "(no clue this round - good luck)";
+      } else if (level === "medium") {
+        clue = scene.subClues[p.quadrant];
+      } else {
+        clue = scene.sharedClue;
+      }
+      io.to(p.id).emit("your_assignment", {
+        quadrant: p.quadrant,
+        clue,
+        bannedWords: scene.bannedWords,
+      });
+    }
+
+    // The timer does NOT start here. It starts once every player's camera
+    // (or mouse fallback) is ready, see player_ready below.
+    broadcastState(room);
+  });
+
+  // Teammates' hand positions only (no drawing content), sent to the room.
+  socket.on("ghost_move", (pos) => {
+    const room = roomOf(socket);
+    if (!room || room.phase !== "DRAWING") return;
+    if (typeof pos?.x !== "number" || typeof pos?.y !== "number") return;
+    socket.to(room.code).emit("ghost_move", { playerId: socket.id, x: pos.x, y: pos.y });
+  });
+
+  socket.on("banned_word_spoken", (word) => {
+    const room = roomOf(socket);
+    if (!room || room.phase !== "DRAWING" || !room.timerStarted || !room.scene) return;
+    if (typeof word !== "string") return;
+    const banned = room.scene.bannedWords.map((w) => String(w).toLowerCase());
+    if (!banned.includes(word.toLowerCase())) return;
+    if (isRateLimited(socket, "banned_word_spoken", 2000)) return;
+
+    room.timeLeft = Math.max(0, room.timeLeft - PENALTY_SECONDS);
+    const speaker = room.players.find((p) => p.id === socket.id);
+    // The word itself is NOT sent. Banned words are the words closest to
+    // the hidden scene, so announcing it would give the scene away.
+    io.to(room.code).emit("penalty", {
+      playerName: speaker ? speaker.name : "Someone",
+      secondsLost: PENALTY_SECONDS,
+    });
+    broadcastState(room);
+  });
+
+  socket.on("player_ready", () => {
+    const room = roomOf(socket);
+    if (!room || room.phase !== "DRAWING" || room.timerStarted) return;
+    if (!room.readyPlayerIds.includes(socket.id)) {
+      room.readyPlayerIds.push(socket.id);
+    }
+    if (room.readyPlayerIds.length >= room.players.length) {
+      room.timerStarted = true;
+      startTimer(room);
+    }
+    broadcastState(room);
+  });
+
+  // Escape hatch: start the countdown even if someone's camera is stuck.
+  socket.on("force_start_timer", () => {
+    const room = roomOf(socket);
+    if (!room || room.phase !== "DRAWING" || room.timerStarted) return;
+    room.timerStarted = true;
+    startTimer(room);
+    broadcastState(room);
+  });
+
+  socket.on("submit_canvas", (dataUrl) => {
+    const room = roomOf(socket);
+    if (!room || room.phase !== "DRAWING") return;
+    if (!isValidImage(dataUrl)) return;
+    const quadrant = socket.data.quadrant;
+    if (quadrant === undefined) return;
+
+    room.submittedCanvases[quadrant] = dataUrl;
+    broadcastState(room);
+
+    if (room.advancing) {
+      // A straggler answered the auto-submit request. If that was the last
+      // one we were waiting for, no need to sit out the rest of the window.
+      const allIn = room.players.every((p) =>
+        Object.prototype.hasOwnProperty.call(room.submittedCanvases, p.quadrant)
+      );
+      if (allIn) {
+        room.advancing = false;
+        finalizeReassembly(room);
+      }
+      return;
+    }
+    maybeAdvanceToReassembly(room);
+  });
+
+  // Move on even if not everyone has submitted. Needs at least one real
+  // submission so there is something to reassemble.
+  socket.on("force_advance", () => {
+    const room = roomOf(socket);
+    if (!room || room.phase !== "DRAWING") return;
+    if (Object.keys(room.submittedCanvases).length === 0) return;
+    maybeAdvanceToReassembly(room, true);
+  });
+
+  socket.on("reassembly_submit", () => {
+    const room = roomOf(socket);
+    if (!room || room.phase !== "REASSEMBLY") return;
+    room.phase = "GUESS";
+    broadcastState(room);
+  });
+
+  socket.on("guess_submit", async (payload) => {
+    const room = roomOf(socket);
+    if (!room || room.phase !== "GUESS" || room.scoring || !room.scene) return;
+    if (isRateLimited(socket, "guess_submit")) return;
+
+    const teamGuess =
+      typeof payload?.teamGuess === "string" ? payload.teamGuess.trim().slice(0, 200) : "";
+    if (!teamGuess || !isValidImage(payload?.compositeImage)) return;
+
+    room.scoring = true;
+    broadcastState(room);
+
+    let aiGuess = null;
+    let teamScore = 0;
+    let aiScore = null;
+    try {
+      // The vision call only ever receives the composite image, never the
+      // scene text, and it is a separate request from scene generation.
+      aiGuess = await guessFromImage(payload.compositeImage);
+      [teamScore, aiScore] = await Promise.all([
+        semanticSimilarity(teamGuess, room.scene.scene),
+        // null means the AI call failed, so there is nothing to score.
+        aiGuess ? semanticSimilarity(aiGuess, room.scene.scene) : Promise.resolve(null),
+      ]);
+    } catch (err) {
+      console.error(`[rooms] ${room.code} scoring failed:`, err);
+      if (rooms.get(room.code) === room && room.scoring) {
+        room.scoring = false;
+        broadcastState(room);
+      }
+      return;
+    }
+
+    // The room may have been reset or emptied while we waited on Gemini.
+    if (rooms.get(room.code) !== room || room.phase !== "GUESS" || !room.scoring) return;
+
+    room.teamGuess = teamGuess;
+    room.aiGuess = aiGuess;
+    room.scores = { teamScore, aiScore };
+    room.scoring = false;
+    room.phase = "REVEAL";
+    broadcastState(room);
+  });
+
+  socket.on("reset_game", () => {
+    const room = roomOf(socket);
+    if (!room) return;
+    resetRoom(room);
+    io.to(room.code).emit("game_reset");
+    broadcastState(room);
+  });
+
+  socket.on("disconnect", () => {
+    for (const action of RATE_LIMITED_ACTIONS) {
+      lastActionTime.delete(socket.id + ":" + action);
+    }
+    leaveRoom(socket);
+  });
+});
+
 app.get("/", (_req, res) => res.send("Blind Canvas server running."));
 
 httpServer.listen(PORT, () =>
   console.log(`Blind Canvas server listening on :${PORT}`)
 );
-
-
-
-
-
-
-
-
-
-
-
