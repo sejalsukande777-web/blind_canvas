@@ -456,3 +456,53 @@ body {
   color: var(--muted);
 }
 
+
+/* ---- Phone-friendly layout ---- */
+.canvas {
+  display: block;
+  max-width: 100%;
+  height: auto;
+}
+
+.canvas-stack {
+  max-width: 100%;
+}
+
+.input {
+  min-width: 0;
+}
+
+.toast {
+  left: 12px;
+  right: 12px;
+  transform: none;
+  width: fit-content;
+  max-width: calc(100vw - 24px);
+  margin: 0 auto;
+  text-align: center;
+}
+
+@media (max-width: 640px) {
+  .app-shell {
+    padding: 16px 8px;
+    align-items: flex-start;
+  }
+
+  .panel {
+    padding: 16px;
+  }
+
+  .row {
+    flex-wrap: wrap;
+  }
+
+  .side-panel,
+  .ghost-panel,
+  .tray {
+    width: 100%;
+  }
+
+  .title {
+    font-size: 1.9rem;
+  }
+}

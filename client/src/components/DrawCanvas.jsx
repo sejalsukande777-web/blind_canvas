@@ -78,7 +78,12 @@ export default function DrawCanvas({
 
   function getMousePos(e) {
     const rect = canvasRef.current.getBoundingClientRect();
-    return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+    // The canvas can be shown smaller than its 420px drawing size (on a
+    // phone), so convert screen pixels back into canvas pixels.
+    return {
+      x: ((e.clientX - rect.left) * SIZE) / rect.width,
+      y: ((e.clientY - rect.top) * SIZE) / rect.height,
+    };
   }
 
   function handlePointerDown(e) {
@@ -369,3 +374,4 @@ export default function DrawCanvas({
     </div>
   );
 }
+

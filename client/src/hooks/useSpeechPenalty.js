@@ -1,17 +1,22 @@
 ﻿import { useEffect, useRef, useState } from "react";
 
+// Whole-word match (plus simple plurals) so "cat" does not fire on words
+// like "hundred" or "education" the way a plain substring check would.
+function containsWholeWord(text, word) {
+  const clean = String(word).toLowerCase().replace(/[^a-z0-9]/g, "");
+  if (!clean) return false;
+  return new RegExp("\\b" + clean + "(s|es)?\\b").test(text);
+}
+
 /**
  * Listens to the player's mic continuously and reports it whenever a
  * finalized sentence contains one of the banned words. Only acts on
- * FINAL results (not interim/in-progress ones) — Web Speech API fires
+ * FINAL results (not interim/in-progress ones) - Web Speech API fires
  * interim results repeatedly as a sentence builds up ("the... the
  * apple... the apple is..."), and checking those too would fire the
  * same penalty multiple times for one utterance.
  *
- * This is purely a browser API — no server call, no npm package. It is
- * NOT tested with a real microphone anywhere in this project's
- * development, since that's impossible outside a real browser. You are
- * the first real test of whether detection timing/accuracy feels right.
+ * This is purely a browser API - no server call, no npm package.
  *
  * @param {boolean} active - only listens while true
  * @param {string[]} bannedWords
@@ -65,7 +70,7 @@ export function useSpeechPenalty(active, bannedWords, onBannedWordDetected) {
         setLastHeard(heardText);
 
         const said = heardText.toLowerCase();
-        const hit = bannedWordsRef.current.find((w) => said.includes(w.toLowerCase()));
+        const hit = bannedWordsRef.current.find((w) => containsWholeWord(said, w));
         if (hit) {
           onDetectedRef.current?.(hit, heardText);
         }
@@ -74,13 +79,13 @@ export function useSpeechPenalty(active, bannedWords, onBannedWordDetected) {
 
     recognition.onerror = (event) => {
       // "no-speech" fires constantly during normal silence between
-      // sentences — that's expected, not a real error, so don't surface it.
+      // sentences - that's expected, not a real error, so don't surface it.
       if (event.error === "no-speech") return;
 
       setStatus("error");
       setError(
         event.error === "not-allowed"
-          ? "Microphone access denied — banned-word detection is off this round."
+          ? "Microphone access denied - banned-word detection is off this round."
           : `Speech detection error: ${event.error}`
       );
     };
@@ -94,7 +99,7 @@ export function useSpeechPenalty(active, bannedWords, onBannedWordDetected) {
         try {
           recognition.start();
         } catch {
-          // already starting/started — ignore, this can race harmlessly
+          // already starting/started - ignore, this can race harmlessly
         }
       }
     };
